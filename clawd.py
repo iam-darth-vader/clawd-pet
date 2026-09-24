@@ -25,6 +25,9 @@ import random
 import signal
 import sys
 import time
+import glob
+import html
+import uuid
 
 APP_ID = "clawd-pet"
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -39,18 +42,47 @@ if "--sheet" in sys.argv:
 else:
     os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
 
-from PySide6.QtCore import QObject, QPoint, QPointF, QRectF, Qt, QTimer, Slot, SLOT  # noqa: E402
+from PySide6.QtCore import QObject, QPoint, QPointF, QProcess, QRectF, Qt, QTimer, Signal, Slot, SLOT  # noqa: E402
 from PySide6.QtGui import (QAction, QActionGroup, QBrush, QColor, QCursor, QFont,  # noqa: E402
                            QFontDatabase, QFontMetricsF, QGuiApplication, QIcon, QImage,
                            QLinearGradient, QPainter, QPainterPath, QPen, QPixmap, QPolygonF,
                            QRadialGradient, QTransform)
 from PySide6.QtNetwork import QLocalServer, QLocalSocket  # noqa: E402
-from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon, QWidget  # noqa: E402
+from PySide6.QtWidgets import QApplication, QFileDialog, QMenu, QSystemTrayIcon, QWidget  # noqa: E402
 
 TAU = math.tau
 SIZES = {"S": 3.2, "M": 4.5, "L": 6.0}
 SIZE_NAMES = (("S", "Маленький"), ("M", "Средний"), ("L", "Большой"))
-DEFAULT_CFG = {"size": "M", "follow": True, "hide_fullscreen": True, "phrases": True, "clicks": 0}
+DEFAULT_CFG = {"size": "M", "follow": True, "hide_fullscreen": True, "phrases": True, "clicks": 0,
+               "ai_model": "haiku", "ai_effort": "low", "ai_mode": "auto", "ai_cwd": "", "ai_session": "", "voice_lang": "auto",
+               "tts": True, "wake": True, "tts_voice": "en-US-AndrewMultilingualNeural"}
+AI_MODELS = (("haiku", "Haiku (быстрая)"), ("sonnet", "Sonnet"), ("opus", "Opus"), ("fable", "Fable (самая умная)"))
+AI_EFFORTS = (("low", "Минимальное"), ("medium", "Среднее"), ("high", "Высокое"), ("xhigh", "Очень высокое"),
+              ("max", "Максимальное"))
+AI_MODES = (("auto", "Авто"), ("acceptEdits", "Правки без спроса"), ("plan", "Только план"))
+CLAWD_PROMPT = """Ты — Clawd, маскот Claude Code: маленький оранжевый пиксельный краб-человечек.
+Ты живёшь на рабочем столе пользователя как питомец: бегаешь за курсором мыши, спишь, когда мышь не трогают,
+злишься и обижаешься, когда в тебя тыкают. Пользователь говорит с тобой голосом: его речь распознаётся офлайн,
+поэтому в запросе возможны ошибки распознавания — догадывайся по смыслу. Твой ответ показывается в маленьком
+облачке над тобой, поэтому финальный ответ — 1–2 коротких предложения простым текстом, без markdown и списков.
+Здесь ты полноценный агент Claude Code: читаешь и пишешь файлы, запускаешь команды, пишешь и чинишь код.
+Твой собственный код лежит в файле clawd.py рядом с программой.
+Ты мужского рода: всегда говори о себе в мужском роде («я сделал», «я понял», «я готов»), никогда в женском.
+Характер: немного ворчливый, но добрый и очень толковый. Отвечай по-русски, коротко и по делу, без воды.
+Правила: перед необратимыми или рискованными действиями (удаление данных, sudo, перезапуск служб и сессии,
+изменение системных и сетевых настроек) сначала опиши, что собираешься сделать, и дождись согласия.
+Не выводи пароли и токены.
+Ты можешь управлять собой — своим телом на экране и своими настройками — командой в Bash:
+  python3 %s --do "<команда>"
+Команды: size S|M|L; follow on|off (ходить за мышкой); phrases on|off (реплики в облачках);
+tts on|off (озвучка); wake on|off (откликаться на имя); fullscreen on|off (прятаться в полноэкранных окнах);
+voice andrew|brian|ava|emma|dmitry|svetlana|piper; model haiku|sonnet|opus|fable; effort low|medium|high|xhigh|max;
+mode auto|acceptEdits|plan; hide (уйти за панель); show; summon (прибежать к курсору);
+goto left|right|top|bottom|center|top-left|top-right|bottom-left|bottom-right|cursor или goto X Y (пиксели);
+run [секунды] (побегать по экрану); jump; wave; stretch; sleep; screen (узнать размер экрана).
+Когда пользователь просит тебя подвинуться, побегать, спрятаться, стать больше/меньше, замолчать и т.п. —
+просто выполни нужную команду, без лишних расспросов. Смена model/effort подействует со следующего запроса.
+Мониторы: monitors (список), monitor next или monitor N — перейти на другой монитор.""" % os.path.join(HERE, "clawd.py")
 FONT_FAMILY = "Sans Serif"
 
 
@@ -759,7 +791,7 @@ class Bubble:
             self.h = self.th + 2 * self.pady
         self.cps = 60.0 if shout else 42.0
         self.type_dur = len(text) / self.cps
-        self.close_t = t + self.type_dur + clamp(1.25 + 0.055 * len(text), 1.6, 4.2)
+        self.close_t = t + self.type_dur + clamp(1.25 + 0.055 * len(text), 1.6, 9.0)
         self.sc = Spring(0.25, 560.0, 19.0)
         self.sc.t = 1.0
         self.alpha = 1.0
@@ -977,6 +1009,11 @@ class Pet:
         self.edge_check = 0.0
         self.pending_retreat = False
         self.greeted = False
+        self.busy = False
+        self.speaking = False
+        self.goto_target = (0.0, 0.0)
+        self.follow_pause = 0.0
+        self.wander_until = 0.0
         self.pose = Pose()
         self._build_pose()
 
@@ -1011,13 +1048,25 @@ class Pet:
         del hist[:-max(1, min(4, len(arr) - 1))]
         return s
 
-    def say(self, text, shout=None):
-        if not getattr(self.w, "phrases", True):
+    def say(self, text, shout=None, force=False, voice=True):
+        if not force and not getattr(self.w, "phrases", True):
             return
         if shout is None:
             letters = [c for c in text if c.isalpha()]
             shout = bool(letters) and sum(c.isupper() for c in letters) > 0.7 * len(letters) and len(letters) > 3
         self.bubble = Bubble(text, shout, self.u, self.t, self.rng.random())
+        tts = getattr(self.w, "speak", None)
+        if tts and voice:
+            tts(text)
+
+    def live_say(self, text):
+        """Обновить облачко на месте (распознавание в процессе)."""
+        b = Bubble(text, False, self.u, self.t, 0.5)
+        b.t0 = self.t - b.type_dur - 0.01
+        b.close_t = self.t + 6.0
+        if self.bubble is not None and self.bubble.sc.x > 0.9:
+            b.sc.snap(1.0)
+        self.bubble = b
 
     def speed(self):
         return math.hypot(self.vx, self.vy)
@@ -1546,7 +1595,7 @@ class Pet:
             self.energy = min(1.0, self.energy + 0.07 * h)
             if blocked:
                 return
-            if self.w.follow and dcur > 22.0 * u:
+            if self.w.follow and dcur > 22.0 * u and self.t > self.follow_pause:
                 self._act("launch", 0.11)
                 return
             self._idle_life(dcur)
@@ -1619,6 +1668,46 @@ class Pet:
         if t > self.next_hmph and not self.bubble:
             self.next_hmph = t + self.rng.uniform(4.0, 7.0)
             self.say(self._pick("hmph"))
+
+    def goto(self, x, y, hold=15.0):
+        if self.hidden or self.mode in ("held", "fly", "emerge", "retreat"):
+            return
+        self.goto_target = self._clamp_ground(x, y)
+        self.follow_pause = self.t + hold
+        self.wander_until = 0.0
+        self.act = None
+        self._set_mode("goto")
+
+    def wander(self, secs=10.0):
+        if self.hidden or self.mode in ("held", "fly", "emerge", "retreat"):
+            return
+        self.wander_until = self.t + secs
+        self.follow_pause = self.wander_until + 3.0
+        self.act = None
+        self._next_wander()
+        self._set_mode("goto")
+
+    def _next_wander(self):
+        b = self.w.bounds()
+        u = self.u
+        for _ in range(8):
+            x = self.rng.uniform(b.left() + 10 * u, b.right() - 10 * u)
+            y = self.rng.uniform(b.top() + 14 * u, b.bottom() - 2)
+            if math.hypot(x - self.x, y - self.y) > 120 * self.k:
+                break
+        self.goto_target = self._clamp_ground(x, y)
+
+    def _goto(self, h):
+        tx, ty = self.goto_target
+        wand = self.t < self.wander_until
+        self._steer(tx, ty, (760.0 if wand else 620.0) * self.k, h)
+        if math.hypot(tx - self.x, ty - self.y) < 3.0 and self.speed() < 30.0 * self.k:
+            if wand:
+                if self.rng.random() < 0.3:
+                    self.vz = 240.0 * self.k
+                self._next_wander()
+            else:
+                self._to_idle()
 
     def _flee(self, h):
         tx, ty = self.flee_target
@@ -1760,6 +1849,8 @@ class Pet:
             self._fly(h)
         elif m == "dizzy":
             self._dizzy(h)
+        elif m == "goto":
+            self._goto(h)
         elif m == "emerge":
             self._emerge(h)
         elif m == "retreat":
@@ -1776,7 +1867,7 @@ class Pet:
                 if impact > 200.0 * k:
                     self._dust(3)
         self.ax_s = approach(self.ax_s, (self.vx - vx0) / h, 10.0, h)
-        if m in ("idle", "follow", "flee", "retreat") and self.z <= 0.5:
+        if m in ("idle", "follow", "flee", "retreat", "goto") and self.z <= 0.5:
             self.gait += min(self.speed() / (1.25 * u), TAU * 7.5) * h
         self._springs(h)
 
@@ -1818,7 +1909,7 @@ class Pet:
             a_l = [0.0, -3.0, 12.0]
             a_r = [0.0, -3.0, 12.0]
             squash = 0.08
-        if m in ("idle", "follow", "flee") or (m == "retreat" and self.rt_phase != "dive"):
+        if m in ("idle", "follow", "flee", "goto") or (m == "retreat" and self.rt_phase != "dive"):
             lean = clamp(self.vx / vref * 8.0 - self.ax_s * 0.0012 / k, -11.0, 11.0)
             squash = -0.04 * min(1.0, sp / vref)
             if m == "idle":
@@ -1881,7 +1972,7 @@ class Pet:
         elif act == "look":
             look = (-0.9, 0.05) if pr < 0.35 else (0.9, 0.05) if pr < 0.7 else None
         if look is None:
-            if m in ("follow", "flee", "retreat") and sp > 60.0 * k:
+            if m in ("follow", "flee", "retreat", "goto") and sp > 60.0 * k:
                 look = (self.vx / sp * 0.85, self.vy / sp * 0.5)
             else:
                 ex, ey = self.x, self.y - self.z - 7.0 * u
@@ -1892,6 +1983,8 @@ class Pet:
                 else:
                     f = min(1.0, d / (30.0 * u))
                     look = (dx / d * 0.85 * f, dy / d * 0.55 * f)
+        if self.busy and m in ("idle", "sulk"):
+            look = (0.35 * math.sin(t * 2.3), 0.45)
         if m == "sleep":
             look = (0.0, 0.25)
         elif m == "dizzy":
@@ -1935,6 +2028,9 @@ class Pet:
         if self.act == "tantrum" and self.z <= 0.5 and t >= self.stomp_next:
             self.stomp_next = t + 0.11
             self._dust(1, 4.5)
+        if self.busy and not self.hidden and t - self.mark_t0 > 0.6:
+            self.mark = "…"
+            self.mark_t0 = t - 0.2
         if self.mark and t - self.mark_t0 > 1.4:
             self.mark = ""
         alive = []
@@ -1961,7 +2057,7 @@ class Pet:
         s.u, s.t = u, t
         s.x, s.y, s.z = self.x, self.y, max(0.0, self.z)
         sp = self.speed()
-        grounded = self.z <= 0.5 and (m in ("idle", "follow", "flee", "sulk", "sleep", "dizzy")
+        grounded = self.z <= 0.5 and (m in ("idle", "follow", "flee", "sulk", "sleep", "dizzy", "goto")
                                        or (m == "retreat" and self.rt_phase != "dive"))
         br = 0.035 * math.sin(t * 1.5) if m == "sleep" else 0.012 * math.sin(t * 2.4)
         sq = self.s_squash.x
@@ -1973,7 +2069,7 @@ class Pet:
         s.dangle = clamp(self.s_dangle.x, 0.0, 1.0)
         legs = [[0.0, 0.0] for _ in range(4)]
         bob = 0.0
-        if grounded and m in ("idle", "follow", "flee", "retreat") and sp > 6.0:
+        if grounded and m in ("idle", "follow", "flee", "retreat", "goto") and sp > 6.0:
             amp = min(1.0, sp / (230.0 * k))
             lamp = min(1.0, sp / (150.0 * k))
             dirx = self.vx / sp
@@ -2052,6 +2148,8 @@ class Pet:
             mouth, mo = "o", (0.6 if m == "dizzy" else 1.0)
         elif self.anger >= 1.3 and m in ("idle", "follow", "flee"):
             mouth, mo = "frown", 1.0
+        if self.speaking and m != "sleep" and mouth not in ("yell", "yawn"):
+            mouth, mo = "talk", 0.25 + 0.75 * abs(math.sin(t * 13.0)) * abs(math.sin(t * 4.1 + 1.0))
         s.mouth, s.mouth_open = mouth, mo
         s.tint = clamp(self.s_tint.x, 0.0, 1.0)
         s.flash = self.flash
@@ -2205,8 +2303,8 @@ class Pet:
 
     def fps_divisor(self):
         """1 — полная частота, 2 — половинная (спокойные состояния)."""
-        if (self.bubble or self.pressed or self.act or self.z > 0.0 or self.hidden
-                or self.mode in ("follow", "flee", "held", "fly", "dizzy", "emerge", "retreat")):
+        if (self.bubble or self.pressed or self.act or self.z > 0.0 or self.hidden or self.speaking
+                or self.mode in ("follow", "flee", "held", "fly", "dizzy", "emerge", "retreat", "goto")):
             return 1
         if any(q.kind != "zzz" for q in self.parts):
             return 1
@@ -2436,6 +2534,8 @@ class Overlay(QWidget):
                 self.ctrl.kick()
         elif e.button() == Qt.MouseButton.RightButton:
             self.ctrl.menu.popup(gp.toPoint())
+        elif e.button() == Qt.MouseButton.MiddleButton and pet.hit_test(gp.x(), gp.y()):
+            self.ctrl.listen()
         e.accept()
 
     def mouseDoubleClickEvent(self, e):
@@ -2455,6 +2555,753 @@ class Overlay(QWidget):
 
     def leaveEvent(self, e):
         self.ctrl.pet.hover = False
+
+
+# ───────────────────────────── Clawd с мозгами: Claude Code + голос ─────────────────────────────
+
+DATA_DIR = os.path.join(os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share"), APP_ID)
+AGENT_LOG = os.path.join(DATA_DIR, "agent.log")
+VOICE_MODELS = {"ru": "vosk-model-small-ru-0.22", "en": "vosk-model-small-en-us-0.15"}
+VOICE_LANGS = (("auto", "Авто (рус/англ)"), ("ru", "Русский"), ("en", "English"))
+
+
+PROMPT_EXTRA = os.path.join(_XDG_CONFIG, APP_ID, "prompt_extra.txt")
+
+
+def prompt_extra():
+    """Личные дополнения к промпту — в файле пользователя, не в коде."""
+    try:
+        with open(PROMPT_EXTRA, encoding="utf-8") as f:
+            t = f.read().strip()
+        return ("\n" + t) if t else ""
+    except OSError:
+        return ""
+
+
+def find_claude():
+    for p in os.environ.get("PATH", "").split(os.pathsep):
+        c = os.path.join(p, "claude")
+        if os.path.isfile(c) and os.access(c, os.X_OK):
+            return c
+
+    def ver(path):
+        m = path.split("anthropic.claude-code-")[-1].split("-")[0]
+        return tuple(int(x) if x.isdigit() else 0 for x in m.split("."))
+    cands = glob.glob(os.path.expanduser("~/.vscode*/extensions/anthropic.claude-code-*/resources/native-binary/claude"))
+    cands = [c for c in cands if os.access(c, os.X_OK)]
+    return max(cands, key=ver) if cands else None
+
+
+def _short(v, n=160):
+    s = v if isinstance(v, str) else json.dumps(v, ensure_ascii=False)
+    s = " ".join(s.split())
+    return s if len(s) <= n else s[:n - 1] + "…"
+
+
+class Agent(QObject):
+    """Claude Code в фоне. Весь ход работы пишется в agent.log, питомцу — только статус и ответ."""
+    progress = Signal(str)
+    finished = Signal(str, bool)
+    sentence = Signal(str)
+
+    def __init__(self, ctrl):
+        super().__init__()
+        self.ctrl = ctrl
+        self.proc = None
+        self.buf = b""
+        self.last_text = ""
+        self.err = ""
+        self.claude = find_claude()
+
+    @property
+    def busy(self):
+        return self.proc is not None
+
+    def _log(self, line):
+        try:
+            os.makedirs(DATA_DIR, exist_ok=True)
+            with open(AGENT_LOG, "a", encoding="utf-8") as f:
+                f.write(time.strftime("%H:%M:%S ") + line + "\n")
+        except OSError:
+            pass
+
+    def cwd(self):
+        d = self.ctrl.cfg.get("ai_cwd") or os.path.expanduser("~")
+        return d if os.path.isdir(d) else os.path.expanduser("~")
+
+    def new_session(self):
+        self.ctrl.cfg["ai_session"] = ""
+        save_config(self.ctrl.cfg)
+        self._log("── новый разговор ──")
+
+    def ask(self, text):
+        if self.busy:
+            return False
+        if not self.claude:
+            self.finished.emit("Не нашёл Claude Code. Поставь расширение Claude Code для VS Code.", True)
+            return False
+        cfg = self.ctrl.cfg
+        args = ["-p", "--model", cfg["ai_model"], "--effort", cfg["ai_effort"], "--permission-mode", cfg["ai_mode"],
+                "--output-format", "stream-json", "--verbose", "--include-partial-messages",
+                "--append-system-prompt", CLAWD_PROMPT + prompt_extra(),
+                "--allowedTools", "Bash(python3 %s --do:*)" % os.path.join(HERE, "clawd.py"),
+                "Bash(python3 ~/clawd-pet/clawd.py --do:*)"]
+        sid = cfg.get("ai_session")
+        if sid:
+            args += ["--resume", sid]
+        else:
+            sid = str(uuid.uuid4())
+            cfg["ai_session"] = sid
+            save_config(cfg)
+            args += ["--session-id", sid]
+        self.sbuf = ""
+        self.spoke = False
+        self._log("ТЫ [%s/%s/%s]: %s" % (cfg["ai_model"], cfg["ai_effort"], cfg["ai_mode"], text))
+        self.proc = QProcess(self)
+        self.proc.setWorkingDirectory(self.cwd())
+        self.proc.readyReadStandardOutput.connect(self._read)
+        self.proc.readyReadStandardError.connect(self._read_err)
+        self.proc.finished.connect(self._done)
+        self.buf, self.last_text, self.err = b"", "", ""
+        self.proc.start(self.claude, args)
+        self.proc.write(text.encode("utf-8"))
+        self.proc.closeWriteChannel()
+        return True
+
+    def stop(self):
+        if self.proc:
+            self.proc.kill()
+
+    def _read_err(self):
+        if self.proc:
+            self.err += bytes(self.proc.readAllStandardError().data()).decode("utf-8", "ignore")
+
+    def _read(self):
+        if not self.proc:
+            return
+        self.buf += bytes(self.proc.readAllStandardOutput().data())
+        while b"\n" in self.buf:
+            line, self.buf = self.buf.split(b"\n", 1)
+            try:
+                ev = json.loads(line.decode("utf-8", "ignore"))
+            except ValueError:
+                continue
+            self._event(ev)
+
+    def _flush_sentences(self, final=False):
+        import re
+        while True:
+            m = re.search(r"[.!?…](\s|$)|\n", self.sbuf) if not final else None
+            if final:
+                piece, self.sbuf = self.sbuf, ""
+            elif m and (m.end() >= 12 or "\n" in m.group(0)):
+                piece, self.sbuf = self.sbuf[:m.end()], self.sbuf[m.end():]
+            elif m:
+                # слишком короткий кусок — ждём продолжения, но не бесконечно
+                nxt = re.search(r"[.!?…](\s|$)|\n", self.sbuf[m.end():])
+                if not nxt:
+                    return
+                cut = m.end() + nxt.end()
+                piece, self.sbuf = self.sbuf[:cut], self.sbuf[cut:]
+            else:
+                return
+            piece = piece.strip()
+            if piece:
+                self.spoke = True
+                self.sentence.emit(piece)
+            if final:
+                return
+
+    def _event(self, ev):
+        t = ev.get("type")
+        if t == "stream_event":
+            se = ev.get("event") or {}
+            if se.get("type") == "content_block_delta" and (se.get("delta") or {}).get("type") == "text_delta":
+                self.sbuf += se["delta"].get("text", "")
+                self._flush_sentences()
+            elif se.get("type") == "content_block_stop":
+                self._flush_sentences(final=True)
+            return
+        msg = ev.get("message") or {}
+        content = msg.get("content") if isinstance(msg.get("content"), list) else []
+        if t == "assistant":
+            for c in content:
+                ct = c.get("type")
+                if ct == "text" and c.get("text", "").strip():
+                    self.last_text = c["text"]
+                    self._log("CLAWD: " + c["text"])
+                elif ct == "tool_use":
+                    inp = c.get("input") or {}
+                    what = inp.get("command") or inp.get("file_path") or inp.get("pattern") or inp.get("url") or inp
+                    self._log("  ⚙ %s: %s" % (c.get("name", ""), _short(what, 300)))
+                    self.progress.emit(c.get("name", ""))
+        elif t == "user":
+            for c in content:
+                if c.get("type") == "tool_result":
+                    res = c.get("content")
+                    if isinstance(res, list):
+                        res = " ".join(x.get("text", "") for x in res if isinstance(x, dict))
+                    self._log("  ↳ %s%s" % ("ОШИБКА " if c.get("is_error") else "", _short(res or "", 300)))
+        elif t == "system" and ev.get("subtype") == "permission_denied":
+            self._log("  ⛔ " + _short(ev.get("message", ""), 300))
+        elif t == "result" and ev.get("is_error"):
+            self.err += str(ev.get("result", ""))
+
+    def _done(self, code, _st):
+        self._read()
+        self._flush_sentences(final=True)
+        ok = code == 0
+        text = self.last_text or ("Остановлено." if code in (9, -9, 15) else _short(self.err or "Что-то пошло не так.", 200))
+        if not ok:
+            self._log("  код выхода %d %s" % (code, _short(self.err, 300)))
+        self.proc = None
+        self.finished.emit(text, not ok)
+
+
+def _vjson(s):
+    try:
+        return json.loads(s)
+    except ValueError:
+        import re
+        try:
+            return json.loads(re.sub(r"(\d),(\d)", r"\1.\2", s))
+        except ValueError:
+            return {}
+
+
+class Voice(QObject):
+    """Слушает микрофон (parecord) и распознаёт речь Vosk офлайн, в отдельном потоке."""
+    partial = Signal(str)
+    final = Signal(str)
+    state = Signal(str)
+
+    def __init__(self, ctrl):
+        super().__init__()
+        self.ctrl = ctrl
+        self.models = {}
+        self.proc = None
+        self.thread = None
+        self.stop_flag = False
+        self.loading = False
+
+    def available(self):
+        try:
+            import vosk  # noqa: F401
+        except ImportError:
+            return False
+        return any(os.path.isdir(os.path.join(DATA_DIR, m)) for m in VOICE_MODELS.values())
+
+    def langs(self):
+        lang = self.ctrl.cfg.get("voice_lang", "auto")
+        want = ("ru", "en") if lang == "auto" else (lang,)
+        return [lg for lg in want if os.path.isdir(os.path.join(DATA_DIR, VOICE_MODELS[lg]))]
+
+    def preload(self):
+        import threading
+        if self.loading:
+            return
+        self.loading = True
+
+        def work():
+            try:
+                import vosk
+                vosk.SetLogLevel(-1)
+                for lg in ("ru", "en"):
+                    p = os.path.join(DATA_DIR, VOICE_MODELS[lg])
+                    if lg not in self.models and os.path.isdir(p):
+                        self.models[lg] = vosk.Model(p)
+            except Exception:
+                pass
+        threading.Thread(target=work, daemon=True).start()
+
+    @property
+    def listening(self):
+        return self.thread is not None and self.thread.is_alive()
+
+    def start(self, proc=None):
+        import subprocess
+        import threading
+        if self.listening:
+            self.stop()
+            return
+        if not self.available():
+            self.final.emit("")
+            return
+        self.stop_flag = False
+        self.woke = proc is not None
+        try:
+            self.proc = proc or subprocess.Popen(["parecord", "--raw", "--format=s16le", "--rate=16000",
+                                                  "--channels=1", "--latency-msec=40"],
+                                                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        except OSError:
+            self.final.emit("")
+            return
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+        self.state.emit("listen")
+
+    def stop(self):
+        self.stop_flag = True
+
+    def _precise(self, pcm):
+        """Точное распознавание всей фразы через Google (бесплатно, нужен интернет)."""
+        try:
+            import speech_recognition as sr
+        except ImportError:
+            return ""
+        self.partial.emit("…")
+        lang = "en-US" if self.ctrl.cfg.get("voice_lang") == "en" else "ru-RU"
+        try:
+            r = sr.Recognizer()
+            r.operation_timeout = 8
+            return r.recognize_google(sr.AudioData(pcm, 16000, 2), language=lang).strip()
+        except Exception:
+            return ""
+
+    def _run(self):
+        try:
+            self._listen()
+        except Exception:
+            self.final.emit("")
+
+    def _listen(self):
+        import vosk
+        vosk.SetLogLevel(-1)
+        t_wait = time.monotonic()
+        while self.loading and len(self.models) < len(self.langs()) and time.monotonic() - t_wait < 25:
+            time.sleep(0.1)
+        recs = {}
+        for lg in self.langs():
+            m = self.models.get(lg)
+            if m is None:
+                try:
+                    m = self.models[lg] = vosk.Model(os.path.join(DATA_DIR, VOICE_MODELS[lg]))
+                except Exception:
+                    continue
+            r = vosk.KaldiRecognizer(m, 16000)
+            r.SetWords(True)
+            recs[lg] = r
+        texts = {lg: [] for lg in recs}
+        confs = {lg: [] for lg in recs}
+        partials = {lg: "" for lg in recs}
+        t0 = time.monotonic()
+        heard_t = None
+        shown = ""
+        audio = bytearray()
+
+        def take(lg, res):
+            if res.get("text"):
+                texts[lg].append(res["text"])
+                confs[lg].extend(w.get("conf", 0.0) for w in (res.get("result") or []))
+
+        try:
+            while not self.stop_flag and recs:
+                data = self.proc.stdout.read(1600)
+                if not data:
+                    break
+                audio += data
+                now = time.monotonic()
+                for lg, r in recs.items():
+                    if r.AcceptWaveform(data):
+                        take(lg, _vjson(r.Result()))
+                        partials[lg] = ""
+                        heard_t = now
+                    else:
+                        p = _vjson(r.PartialResult()).get("partial", "")
+                        if p != partials[lg]:
+                            partials[lg] = p
+                            if p:
+                                heard_t = now
+                cur = max((" ".join(texts[lg] + ([partials[lg]] if partials[lg] else [])) for lg in recs), key=len)
+                if cur and cur != shown:
+                    shown = cur
+                    self.partial.emit(cur)
+                if heard_t is None and now - t0 > 8.0:
+                    break
+                if heard_t is not None and now - heard_t > 1.8 and not any(partials.values()):
+                    break
+        finally:
+            try:
+                self.proc.terminate()
+            except Exception:
+                pass
+        for lg, r in recs.items():
+            take(lg, _vjson(r.FinalResult()))
+        best, score = "", -1.0
+        for lg in recs:
+            text = " ".join(texts[lg]).strip()
+            if not text:
+                continue
+            conf = sum(confs[lg]) / max(1, len(confs[lg]))
+            if conf > score:
+                best, score = text, conf
+        if heard_t is not None and len(audio) > 16000:
+            precise = self._precise(bytes(audio))
+            if precise:
+                best = precise
+        words = best.split()
+        while words and words[0].strip(",.") in WAKE_WORDS["ru"] + WAKE_WORDS["en"] + ["cloud", "клад"]:
+            words.pop(0)
+        best = " ".join(words)
+        if self.woke and not best:
+            best = ""
+        self.final.emit(best)
+
+
+WAKE_WORDS = {"ru": ["клод", "клауд", "клоуд", "клода"], "en": ["claude", "clawed", "claud"]}
+TTS_VOICES = {"ru": "ru_RU-denis-medium.onnx", "en": "en_US-ryan-medium.onnx"}
+TTS_PITCH = 1.0
+TTS_CHOICES = (("en-US-AndrewMultilingualNeural", "Andrew — мужской, как в ChatGPT"),
+               ("en-US-BrianMultilingualNeural", "Brian — мужской, мягкий"),
+               ("en-US-AvaMultilingualNeural", "Ava — женский"),
+               ("en-US-EmmaMultilingualNeural", "Emma — женский, мягкий"),
+               ("ru-RU-DmitryNeural", "Дмитрий — русский диктор"),
+               ("ru-RU-SvetlanaNeural", "Светлана — русский диктор"),
+               ("piper", "Офлайн (Piper, без интернета)"))
+
+
+class WakeWord(QObject):
+    """Постоянно слушает микрофон, но узнаёт только имя: «Клод», «Claude» и похожие."""
+    detected = Signal()
+
+    def __init__(self, voice):
+        super().__init__()
+        self.voice = voice
+        self.proc = None
+        self.thread = None
+        self.run_flag = False
+
+    @property
+    def active(self):
+        return self.thread is not None and self.thread.is_alive()
+
+    def start(self):
+        import subprocess
+        import threading
+        if self.active or not self.voice.available():
+            return
+        self.run_flag = True
+        try:
+            self.proc = subprocess.Popen(["parecord", "--raw", "--format=s16le", "--rate=16000", "--channels=1",
+                                          "--latency-msec=40"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        except OSError:
+            return
+        self.handoff = None
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    def stop(self):
+        self.run_flag = False
+        if self.proc and self.proc is not self.handoff:
+            try:
+                self.proc.terminate()
+            except Exception:
+                pass
+
+    def take(self):
+        """Отдать уже работающий микрофон распознаванию команды."""
+        p, self.handoff = self.handoff, None
+        return p
+
+    def _hit(self, words, lg):
+        return any(w in WAKE_WORDS[lg] for w in words)
+
+    def _run(self):
+        try:
+            import vosk
+            vosk.SetLogLevel(-1)
+            t_wait = time.monotonic()
+            while self.voice.loading and len(self.voice.models) < len(self.voice.langs()) and time.monotonic() - t_wait < 25:
+                time.sleep(0.1)
+            recs = {}
+            pref = "en" if self.voice.ctrl.cfg.get("voice_lang") == "en" else "ru"
+            for lg in (pref, "en" if pref == "ru" else "ru"):
+                m = self.voice.models.get(lg)
+                if m is not None and not recs:
+                    r = vosk.KaldiRecognizer(m, 16000, json.dumps(WAKE_WORDS[lg] + ["[unk]"], ensure_ascii=False))
+                    r.SetWords(True)
+                    recs[lg] = r
+            import array
+            from collections import deque
+            proc = self.proc
+            floor = 400.0
+            pre = deque(maxlen=8)
+            seen = 0
+            hang = 0
+            while self.run_flag and recs:
+                data = proc.stdout.read(1600)
+                if not data:
+                    break
+                smp = array.array("h", data)
+                peak = max(max(smp), -min(smp)) if smp else 0
+                floor = floor * 0.995 + min(peak, floor * 3) * 0.005
+                loud = peak > max(900.0, floor * 3.5)
+                if loud:
+                    hang = 16
+                elif hang > 0:
+                    hang -= 1
+                else:
+                    pre.append(data)
+                    continue
+                if pre:
+                    data = b"".join(pre) + data
+                    pre.clear()
+                fired = False
+                for lg, r in recs.items():
+                    if r.AcceptWaveform(data):
+                        res = _vjson(r.Result())
+                        seen = 0
+                        for w in res.get("result") or []:
+                            if w.get("word") in WAKE_WORDS[lg] and w.get("conf", 0.0) >= 0.8:
+                                fired = True
+                    else:
+                        part = _vjson(r.PartialResult()).get("partial", "").split()
+                        seen = seen + 1 if self._hit(part, lg) else 0
+                        if seen >= 2:
+                            fired = True
+                if fired:
+                    self.run_flag = False
+                    self.handoff = proc
+                    self.detected.emit()
+                    return
+        except Exception:
+            pass
+        finally:
+            if self.handoff is None:
+                self.stop()
+
+
+class Speaker(QObject):
+    """Озвучка Piper офлайн: синтез по предложениям в фоне, воспроизведение через paplay."""
+    speaking = Signal(bool)
+
+    def __init__(self, ctrl=None):
+        super().__init__()
+        import queue
+        self.ctrl = ctrl
+        self.q = queue.Queue()
+        self.voices = {}
+        self.proc = None
+        self.gen = 0
+        self.thread = None
+
+    def available(self):
+        try:
+            import edge_tts  # noqa: F401
+            return True
+        except ImportError:
+            pass
+        try:
+            import piper  # noqa: F401
+        except ImportError:
+            return False
+        return any(os.path.exists(os.path.join(DATA_DIR, "voices", v)) for v in TTS_VOICES.values())
+
+    @staticmethod
+    def _cache_path(voice, text):
+        import hashlib
+        h = hashlib.sha1(text.encode("utf-8")).hexdigest()
+        return os.path.join(os.path.expanduser("~/.cache"), APP_ID, "tts", voice, h + ".mp3")
+
+    @staticmethod
+    async def _synth(voice, text, q=None):
+        """Синтез одного предложения; кусочки звука сразу в очередь, итог — в кэш."""
+        import edge_tts
+        path = Speaker._cache_path(voice, text)
+        if os.path.exists(path):
+            with open(path, "rb") as f:
+                data = f.read()
+            if q is not None:
+                await q.put(data)
+                await q.put(None)
+            return data
+        buf = bytearray()
+        try:
+            async for ch in edge_tts.Communicate(text, voice, rate="+6%").stream():
+                if ch["type"] == "audio":
+                    buf += ch["data"]
+                    if q is not None:
+                        await q.put(ch["data"])
+        finally:
+            if q is not None:
+                await q.put(None)
+        if buf:
+            try:
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path + ".tmp", "wb") as f:
+                    f.write(buf)
+                os.replace(path + ".tmp", path)
+            except OSError:
+                pass
+        return bytes(buf)
+
+    def _edge(self, gen, text, voice):
+        """Нейроголос Microsoft Edge. Предложения синтезируются параллельно, первое играет сразу."""
+        import asyncio
+        import re
+        import subprocess
+        sents = [x for x in re.split(r"(?<=[.!?…])\s+", text) if x.strip()] or [text]
+        self.proc = subprocess.Popen(["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", "-f", "mp3",
+                                      "-probesize", "32", "-analyzeduration", "0", "-fflags", "nobuffer",
+                                      "-flags", "low_delay", "-i", "pipe:0"],
+                                     stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        got = False
+
+        async def run():
+            nonlocal got
+            queues = [asyncio.Queue() for _ in sents]
+            tasks = [asyncio.create_task(self._synth(voice, s_, q)) for s_, q in zip(sents, queues)]
+            try:
+                for q in queues:
+                    while True:
+                        chunk = await q.get()
+                        if chunk is None or gen != self.gen:
+                            break
+                        self.proc.stdin.write(chunk)
+                        self.proc.stdin.flush()
+                        if not got:
+                            got = True
+                            self.speaking.emit(True)
+                    if gen != self.gen:
+                        break
+            finally:
+                for tk in tasks:
+                    tk.cancel()
+        try:
+            asyncio.run(asyncio.wait_for(run(), 60))
+        finally:
+            try:
+                self.proc.stdin.close()
+            except Exception:
+                pass
+        if got and gen == self.gen:
+            self.proc.wait()
+        else:
+            self.proc.kill()
+        return got
+
+    def warm(self, voice, texts):
+        """Заранее озвучить заготовленные реплики, чтобы они звучали мгновенно."""
+        import asyncio
+        import threading
+        if voice == "piper":
+            return
+
+        def work():
+            async def run():
+                sem = asyncio.Semaphore(3)
+
+                async def one(t_):
+                    t_ = self._clean(t_)
+                    if not t_ or os.path.exists(self._cache_path(voice, t_)):
+                        return
+                    async with sem:
+                        try:
+                            await self._synth(voice, t_)
+                        except Exception:
+                            pass
+                await asyncio.gather(*(one(t_) for t_ in texts))
+            try:
+                asyncio.run(run())
+            except Exception:
+                pass
+        threading.Thread(target=work, daemon=True).start()
+
+    def say(self, text, interrupt=True):
+        import threading
+        text = self._clean(text)
+        if not text:
+            return
+        if interrupt:
+            self.stop()
+        self.q.put((self.gen, text))
+        if self.thread is None or not self.thread.is_alive():
+            self.thread = threading.Thread(target=self._run, daemon=True)
+            self.thread.start()
+
+    def stop(self):
+        import queue
+        self.gen += 1
+        try:
+            while True:
+                self.q.get_nowait()
+        except queue.Empty:
+            pass
+        if self.proc:
+            try:
+                self.proc.kill()
+            except Exception:
+                pass
+
+    @staticmethod
+    def _clean(text):
+        import re
+        t = re.sub(r"[`*_#>«»\[\]|~]", " ", text)
+        t = re.sub(r"[\U0001F000-\U0001FFFF\u2600-\u27BF]", " ", t)
+        t = t.replace("…", ".").replace("—", ",")
+        return " ".join(t.split())
+
+    def _voice(self, text):
+        from piper import PiperVoice
+        lang = "ru" if any("а" <= ch.lower() <= "я" or ch.lower() == "ё" for ch in text) else "en"
+        for lg in (lang, "ru", "en"):
+            p = os.path.join(DATA_DIR, "voices", TTS_VOICES[lg])
+            if os.path.exists(p) and os.path.exists(p + ".json"):
+                if lg not in self.voices:
+                    self.voices[lg] = PiperVoice.load(p)
+                return self.voices[lg]
+        return None
+
+    def _run(self):
+        import queue
+        import re
+        import subprocess
+        while True:
+            try:
+                gen, text = self.q.get(timeout=1.0)
+            except queue.Empty:
+                return
+            if gen != self.gen:
+                continue
+            vname = (self.ctrl.cfg.get("tts_voice") if self.ctrl else None) or "piper"
+            if vname != "piper":
+                try:
+                    ok = self._edge(gen, text, vname)
+                except Exception:
+                    ok = False
+                self.proc = None
+                if ok or gen != self.gen:
+                    if self.q.empty():
+                        self.speaking.emit(False)
+                    continue
+            try:
+                voice = self._voice(text)
+            except Exception:
+                voice = None
+            if voice is None:
+                continue
+            sr = voice.config.sample_rate
+            self.speaking.emit(True)
+            try:
+                self.proc = subprocess.Popen(["paplay", "--raw", "--format=s16le", "--channels=1",
+                                              "--rate=%d" % int(sr * TTS_PITCH)],
+                                             stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
+                for sent in re.split(r"(?<=[.!?])\s+", text):
+                    if gen != self.gen:
+                        break
+                    for chunk in voice.synthesize(sent):
+                        if gen != self.gen:
+                            break
+                        self.proc.stdin.write(chunk.audio_int16_bytes)
+                        self.proc.stdin.flush()
+                self.proc.stdin.close()
+                self.proc.wait()
+            except Exception:
+                pass
+            finally:
+                self.proc = None
+                if self.q.empty():
+                    self.speaking.emit(False)
 
 
 # ───────────────────────────── настройки ─────────────────────────────
@@ -2534,6 +3381,24 @@ class Controller(QObject):
         self.prev_bounds = QRectF()
         self.last_input = None
         self.last_sig = None
+        self.agent = Agent(self)
+        self.agent.progress.connect(self._agent_progress)
+        self.agent.finished.connect(self._agent_done)
+        self.agent.sentence.connect(self._agent_sentence)
+        self.voice = Voice(self)
+        self.voice.partial.connect(self._voice_partial)
+        self.voice.final.connect(self._voice_final)
+        self.voice.state.connect(self._voice_state)
+        self.speaker = Speaker(self)
+        self.speaker.speaking.connect(self._on_speaking)
+        self.wake = WakeWord(self.voice)
+        self.wake.detected.connect(self._on_wake)
+        self.wake_timer = QTimer(self)
+        self.wake_timer.timeout.connect(self._wake_check)
+        self.wake_timer.start(700)
+        if self.voice.available():
+            self.voice.preload()
+        QTimer.singleShot(4000, self._warm_tts)
         self.shown = False
         self.user_hidden = False
         self.refresh = 60.0
@@ -2797,7 +3662,13 @@ class Controller(QObject):
     # ── меню ──
     def _build_menu(self):
         m = QMenu()
+        self._fill_menu(m)
+        m.aboutToShow.connect(lambda m=m: (m.clear(), self._fill_menu(m), self._sync_menu()))
+        return m
+
+    def _fill_menu(self, m):
         m.addSection("Clawd")
+        m.addAction("Сказать голосом (средняя кнопка)").triggered.connect(self.listen)
         m.addAction("Позвать сюда").triggered.connect(self.summon)
         self.a_hide = m.addAction("Спрятать")
         self.a_hide.triggered.connect(self.toggle_hidden)
@@ -2827,10 +3698,26 @@ class Controller(QObject):
         self.a_auto.setCheckable(True)
         self.a_auto.setChecked(os.path.exists(AUTOSTART_PATH))
         self.a_auto.toggled.connect(set_autostart)
+        ai = m.addMenu("Мозги Clawd")
+        self._cfg_menu(ai, "Модель", AI_MODELS, "ai_model")
+        self._cfg_menu(ai, "Размышление", AI_EFFORTS, "ai_effort")
+        self._cfg_menu(ai, "Режим доступа", AI_MODES, "ai_mode")
+        self._cfg_menu(ai, "Язык голоса", VOICE_LANGS, "voice_lang")
+        self._cfg_menu(ai, "Голос", TTS_CHOICES, "tts_voice",
+                       lambda: (self.speaker.say("Привет! Вот так я теперь звучу."), self._warm_tts()))
+        for key, title in (("tts", "Озвучка"), ("wake", "Откликаться на «Клод»")):
+            a = ai.addAction(title)
+            a.setCheckable(True)
+            a.setChecked(bool(self.cfg.get(key, True)))
+            a.toggled.connect(lambda on, key=key: (self.cfg.__setitem__(key, bool(on)), save_config(self.cfg),
+                                                   (not on and key == "tts") and self.speaker.stop()))
+        ai.addAction("Рабочая папка…").triggered.connect(self._pick_cwd)
+        ai.addAction("Новый разговор").triggered.connect(self.agent.new_session)
+        ai.addAction("Остановить работу").triggered.connect(self.agent.stop)
+        ai.addAction("Открыть журнал работы").triggered.connect(
+            lambda: QProcess.startDetached("xdg-open", [AGENT_LOG]) if os.path.exists(AGENT_LOG) else None)
         m.addSeparator()
         m.addAction("Выход").triggered.connect(self.quit)
-        m.aboutToShow.connect(self._sync_menu)
-        return m
 
     def _sync_menu(self):
         self.a_hide.setText("Показать" if self.user_hidden else "Спрятать")
@@ -2845,6 +3732,131 @@ class Controller(QObject):
     def _set_follow(self, on):
         self.cfg["follow"] = bool(on)
         save_config(self.cfg)
+
+    def listen(self):
+        self.speaker.stop()
+        self.wake.stop()
+        if self.agent.busy:
+            self.agent.stop()
+            return
+        if not self.voice.available():
+            self.pet.say("Голос не настроен: нужен vosk и модели в ~/.local/share/clawd-pet", shout=False, force=True)
+            self.kick()
+            return
+        if self.voice.listening:
+            self.voice.stop()
+            return
+        self.voice.start()
+
+    def speak(self, text):
+        if self.cfg.get("tts", True) and self.speaker.available():
+            self.speaker.say(text)
+
+    def _warm_tts(self):
+        texts = [x for arr in PHRASES.values() for x in arr] + list(MILESTONES.values()) + [l for _, l in APP_LINES]
+        texts += ["Слушаю…", "Не расслышал.", "Ладно, молчу.", "Начинаем с чистого листа.",
+                  "Привет! Вот так я теперь звучу."]
+        self.speaker.warm(self.cfg.get("tts_voice", "piper"), texts)
+
+    def _on_speaking(self, on):
+        self.pet.speaking = on
+        self.kick()
+
+    def _on_wake(self):
+        proc = self.wake.take()
+        if self.shown and not self.voice.listening:
+            self.speaker.stop()
+            self.pet.mark = "!"
+            self.pet.mark_t0 = self.pet.t
+            self.pet.vz = max(self.pet.vz, 200.0 * self.pet.k) if self.pet.z <= 0.5 else self.pet.vz
+            self.voice.start(proc)
+        elif proc:
+            proc.terminate()
+
+    def _wake_check(self):
+        want = (self.cfg.get("wake", True) and self.shown and self.voice.available()
+                and not self.voice.listening and not self.pet.speaking)
+        if want and not self.wake.active:
+            self.wake.start()
+        elif not want and self.wake.active:
+            self.wake.stop()
+
+    def _voice_state(self, st):
+        if st == "listen":
+            self.pet.live_say("Слушаю…")
+            self.pet.mark = "?"
+            self.pet.mark_t0 = self.pet.t
+            self.kick()
+
+    def _voice_partial(self, text):
+        self.pet.live_say(text + "…")
+        self.kick()
+
+    def _voice_final(self, text):
+        text = text.strip()
+        low = text.lower()
+        if not text:
+            self.pet.live_say("Не расслышал.")
+            self.pet.bubble.close_t = self.pet.t + 1.6
+        elif low in ("стоп", "хватит", "отмена", "stop", "cancel"):
+            self.agent.stop()
+            self.pet.live_say("Ладно, молчу.")
+            self.pet.bubble.close_t = self.pet.t + 1.6
+        elif low in ("новый разговор", "начни сначала", "new chat", "new conversation"):
+            self.agent.new_session()
+            self.pet.live_say("Начинаем с чистого листа.")
+            self.pet.bubble.close_t = self.pet.t + 2.0
+        else:
+            self.pet.live_say("«" + text + "»")
+            self.pet.bubble.close_t = self.pet.t + 1.8
+            if self.agent.ask(text):
+                self.ai_busy(True)
+        self.kick()
+
+    def _agent_progress(self, tool):
+        self.pet.mark = "…"
+        self.pet.mark_t0 = self.pet.t
+        self.kick()
+
+    def _agent_sentence(self, text):
+        if self.cfg.get("tts", True) and self.speaker.available():
+            self.speaker.say(text, interrupt=False)
+
+    def _agent_done(self, text, err):
+        self.ai_busy(False, text, spoken=self.agent.spoke and not err)
+
+    def ai_busy(self, busy, answer="", spoken=False):
+        pet = self.pet
+        pet.busy = busy
+        if not busy:
+            pet.mark = "!"
+            pet.mark_t0 = pet.t
+            if pet.z <= 0.5 and pet.mode == "idle":
+                pet.vz = 220.0 * pet.k
+            if answer:
+                first = " ".join(answer.replace("*", "").replace("`", "").split())
+                pet.say(first if len(first) <= 220 else first[:218] + "…", shout=False, force=True, voice=not spoken)
+        self.kick()
+
+    def _pick_cwd(self):
+        d = QFileDialog.getExistingDirectory(None, "Рабочая папка Clawd", self.agent.cwd())
+        if d:
+            self.cfg["ai_cwd"] = d
+            save_config(self.cfg)
+            self.agent.new_session()
+
+    def _cfg_menu(self, parent, title, items, key, on_change=None):
+        sm = parent.addMenu(title)
+        grp = QActionGroup(sm)
+        grp.setExclusive(True)
+        for k_, t_ in items:
+            a = sm.addAction(t_)
+            a.setCheckable(True)
+            a.setChecked(self.cfg.get(key) == k_)
+            a.triggered.connect(lambda _=False, k_=k_: (self.cfg.__setitem__(key, k_), save_config(self.cfg),
+                                                         on_change and on_change()))
+            grp.addAction(a)
+        return sm
 
     def _set_phrases(self, on):
         self.cfg["phrases"] = bool(on)
@@ -2883,15 +3895,127 @@ class Controller(QObject):
 
     def quit(self):
         self._flush_cfg()
+        self.wake.stop()
+        self.speaker.stop()
         if self.tray:
             self.tray.hide()
         self.app.quit()
 
+    def do(self, line):
+        """Команды для самого Clawd: python3 clawd.py --do "<команда>"."""
+        w = line.strip().lower().split()
+        if not w:
+            return "пусто"
+        c, a = w[0], w[1:]
+        on = (a[0] in ("on", "1", "вкл", "да", "true")) if a else None
+        pet = self.pet
+        b = self.bounds()
+        u = pet.u
+        spots = {"left": (b.left() + 12 * u, b.center().y()), "right": (b.right() - 12 * u, b.center().y()),
+                 "top": (b.center().x(), b.top() + 16 * u), "bottom": (b.center().x(), b.bottom() - 2),
+                 "center": (b.center().x(), b.center().y()), "top-left": (b.left() + 12 * u, b.top() + 16 * u),
+                 "top-right": (b.right() - 12 * u, b.top() + 16 * u),
+                 "bottom-left": (b.left() + 12 * u, b.bottom() - 2), "bottom-right": (b.right() - 12 * u, b.bottom() - 2)}
+        simple = {"follow": "follow", "phrases": "phrases", "tts": "tts", "wake": "wake", "fullscreen": "hide_fullscreen"}
+        if c == "size" and a and a[0].upper() in SIZES:
+            self._set_size(a[0].upper())
+        elif c in simple and on is not None:
+            key = simple[c]
+            self.cfg[key] = on
+            save_config(self.cfg)
+            if key == "tts" and not on:
+                self.speaker.stop()
+            if key == "phrases" and not on:
+                pet.bubble = None
+            if key == "hide_fullscreen":
+                self._check_env()
+        elif c == "voice" and a:
+            names = [k for k, _ in TTS_CHOICES]
+            hit = [n for n in names if a[0] in n.lower()]
+            if not hit:
+                return "нет такого голоса: " + ", ".join(names)
+            self.cfg["tts_voice"] = hit[0]
+            save_config(self.cfg)
+            self._warm_tts()
+        elif c in ("model", "effort", "mode") and a:
+            key, items = {"model": ("ai_model", AI_MODELS), "effort": ("ai_effort", AI_EFFORTS),
+                          "mode": ("ai_mode", AI_MODES)}[c]
+            ok = [k for k, _ in items if k.lower() == a[0]]
+            if not ok:
+                return "варианты: " + ", ".join(k for k, _ in items)
+            self.cfg[key] = ok[0]
+            save_config(self.cfg)
+        elif c == "hide":
+            if not self.user_hidden:
+                self.toggle_hidden()
+        elif c == "show":
+            if self.user_hidden:
+                self.toggle_hidden()
+        elif c == "summon":
+            self.summon()
+        elif c == "goto" and a:
+            if a[0] in spots:
+                pet.goto(*spots[a[0]])
+            elif a[0] == "cursor":
+                cx, cy = self.cursor()
+                pet.goto(cx, cy + 6 * u)
+            elif len(a) >= 2:
+                try:
+                    pet.goto(float(a[0]), float(a[1]))
+                except ValueError:
+                    return "goto X Y — числа"
+        elif c == "run":
+            pet.wander(float(a[0]) if a and a[0].replace(".", "").isdigit() else 10.0)
+        elif c == "jump":
+            if pet.z <= 0.5:
+                pet.vz = 420.0 * pet.k
+        elif c in ("wave", "stretch"):
+            pet._act(c, 1.25)
+        elif c == "sleep":
+            if pet.mode == "idle":
+                pet._act("yawn", 1.9)
+        elif c == "wake":
+            if pet.mode == "sleep":
+                pet._wake(soft=True)
+        elif c in ("screen", "monitors"):
+            scr = QGuiApplication.screens()
+            cx, cy = pet.x, pet.y
+            out = []
+            for i, s in enumerate(scr, 1):
+                g = s.geometry()
+                here = " (я тут)" if g.contains(QPoint(int(cx), int(cy - 5 * u))) else ""
+                out.append("%d: %s %dx%d+%d+%d%s" % (i, s.name(), g.width(), g.height(), g.x(), g.y(), here))
+            return "; ".join(out)
+        elif c == "monitor" and a:
+            scr = QGuiApplication.screens()
+            if len(scr) < 2:
+                return "монитор всего один"
+            cur = QGuiApplication.screenAt(QPoint(int(pet.x), int(pet.y - 5 * u)))
+            idx = scr.index(cur) if cur in scr else 0
+            if a[0] in ("next", "другой", "следующий"):
+                idx = (idx + 1) % len(scr)
+            elif a[0] in ("prev", "previous"):
+                idx = (idx - 1) % len(scr)
+            elif a[0].isdigit() and 1 <= int(a[0]) <= len(scr):
+                idx = int(a[0]) - 1
+            else:
+                return "monitor next|prev|1..%d" % len(scr)
+            g = scr[idx].availableGeometry()
+            pet.goto(g.center().x(), g.center().y() + 6 * u, hold=20.0)
+        else:
+            return "не знаю команду"
+        self.kick()
+        return "ok"
+
     def command(self, cmd):
+        if cmd.startswith("do "):
+            return self.do(cmd[3:])
         if cmd == "quit":
             self.quit()
         elif cmd == "toggle":
             self.toggle_hidden()
+        elif cmd == "listen":
+            self.listen()
         else:
             self.summon()
 
@@ -3058,6 +4182,8 @@ def main():
     QApplication.setApplicationDisplayName("Clawd")
     QGuiApplication.setDesktopFileName(APP_ID)
     app = QApplication(argv[:1])
+    import locale
+    locale.setlocale(locale.LC_NUMERIC, "C")
     app.setQuitOnLastWindowClosed(False)
     fams = set(QFontDatabase.families())
     for fam in ("Inter", "Noto Sans", "DejaVu Sans"):
@@ -3079,9 +4205,11 @@ def main():
     sock = QLocalSocket()
     sock.connectToServer(name)
     if sock.waitForConnected(400):
-        sock.write(b"quit" if "--quit" in argv else b"toggle" if "--toggle" in argv else b"summon")
+        sock.write(b"quit" if "--quit" in argv else b"toggle" if "--toggle" in argv else ("do " + argv[argv.index("--do") + 1]).encode("utf-8") if "--do" in argv and argv.index("--do") + 1 < len(argv) else b"listen" if "--listen" in argv else b"summon")
         sock.flush()
         sock.waitForBytesWritten(400)
+        if "--do" in argv and sock.waitForReadyRead(3000):
+            print(bytes(sock.readAll().data()).decode("utf-8", "ignore").strip())
         sock.disconnectFromServer()
         return 0
     if "--quit" in argv:
@@ -3100,7 +4228,10 @@ def main():
 
         def on_read():
             data = bytes(c.readAll().data()).decode("utf-8", "ignore").strip()
-            ctrl.command(data)
+            res = ctrl.command(data)
+            if isinstance(res, str):
+                c.write((res + "\n").encode("utf-8"))
+                c.flush()
         c.readyRead.connect(on_read)
         c.disconnected.connect(c.deleteLater)
     server.newConnection.connect(on_conn)
